@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Medication Location Tracker</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#06b6d4;--muted:#94a3b8}
+    body{font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,#071029, #071b2a);color:#e6eef6;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+    .card{width:760px;max-width:100%;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px;padding:20px;box-shadow:0 8px 30px rgba(2,6,23,0.6)}
+    h1{margin:0 0 8px;font-size:20px}
+    p.small{margin:0 0 16px;color:var(--muted)}
+    .row{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+    label{font-size:13px;color:var(--muted);min-width:160px}
+    button{background:var(--accent);border:none;padding:10px 14px;border-radius:8px;color:#012;cursor:pointer;font-weight:600}
+    button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--muted);font-weight:600}
+    .info{background:rgba(255,255,255,0.02);padding:12px;border-radius:8px;color:var(--muted)}
+    .coords{font-family:monospace;font-size:13px;color:#dff6fb}
+    .big{font-size:18px;color:#fff;font-weight:700}
+    input[type=range]{width:220px}
+    .status{padding:8px;border-radius:8px;margin-top:8px;background:rgba(255,255,255,0.01)}
+    .danger{color:#ffb4b4}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Medication location tracker</h1>
+    <p class="small">Save a location (e.g., where your pills are). When you move outside the saved radius (100–150 m) you’ll get an alert: <em>Have you taken your tablet?</em></p>
+
+    <div class="row">
+      <label>Saved location</label>
+      <div style="flex:1">
+        <div id="savedInfo" class="info">No saved location yet.</div>
+      </div>
+      <button id="clearSaved" class="ghost">Clear</button>
+    </div>
+
+    <div class="row">
+      <label>Current position</label>
+      <div style="flex:1">
+        <div id="currentInfo" class="info">Not available</div>
+      </div>
+      <button id="saveHere">Save current location</button>
+    </div>
+
+    <div class="row">
+      <label>Radius (meters)</label>
+      <div style="flex:1;display:flex;align-items:center;gap:12px;">
+        <input id="radius" type="range" min="100" max="150" value="120">
+        <div class="coords" id="radiusVal">120 m</div>
+      </div>
+      <button id="saveRadius" class="ghost">Save radius</button>
+    </div>
+
+    <div class="row">
+      <label>Tracking</label>
+      <div style="flex:1">
+        <div class="status" id="trackingStatus">Not tracking</div>
+      </div>
+      <button id="toggleTrack">Start tracking</button>
+    </div>
+
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <div class="info" style="flex:1">
+        <div class="big" id="distanceDisplay">—</div>
+        <div class="coords" id="distanceDetail">Distance from saved location</div>
+      </div>
+      <div style="width:220px">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Notifications</div>
+        <button id="requestNotifs">Request permission</button>
+      </div>
+    </div>
+
+    <p class="small" style="margin-top:14px">Notes: This app must be served over <strong>HTTPS</strong> (or localhost) for geolocation and notifications to work. You can open this file locally for testing (Chrome treats file:// differently — use a simple local server). Notifications/vibration require device support and permission.</p>
+  </div>
+
+  <script>
+    // Helper: Haversine distance in meters
+    function haversine(lat1, lon1, lat2, lon2) {
+      const R = 6371000; // meters
+      const toRad = v => v * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    // DOM
+    const savedInfo = document.getElementById('savedInfo');
+    const currentInfo = document.getElementById('currentInfo');
+    const saveHereBtn = document.getElementById('saveHere');
+    const clearSavedBtn = document.getElementById('clearSaved');
+    const radiusEl = document.getElementById('radius');
+    const radiusVal = document.getElementById('radiusVal');
+    const saveRadiusBtn = document.getElementById('saveRadius');
+    const toggleTrackBtn = document.getElementById('toggleTrack');
+    const trackingStatus = document.getElementById('trackingStatus');
+    const distanceDisplay = document.getElementById('distanceDisplay');
+    const distanceDetail = document.getElementById('distanceDetail');
+    const requestNotifsBtn = document.getElementById('requestNotifs');
+
+    // State
+    let watchId = null;
+    let lastDistance = null;
+    let alerted = false; // avoid repeating alerts continuously
+
+    // Persistence keys
+    const KEY_LOC = 'med_saved_location_v1';
+    const KEY_RADIUS = 'med_saved_radius_v1';
+
+    function loadSaved() {
+      const loc = localStorage.getItem(KEY_LOC);
+      const radius = localStorage.getItem(KEY_RADIUS) || 120;
+      radiusEl.value = Number(radius);
+      radiusVal.textContent = radius + ' m';
+      if (loc) {
+        const o = JSON.parse(loc);
+        savedInfo.innerHTML = `<div class="coords">lat: ${o.lat.toFixed(6)}, lon: ${o.lon.toFixed(6)}</div><div style="font-size:12px;color:var(--muted)">saved on: ${new Date(o.t).toLocaleString()}</div>`;
+      } else {
+        savedInfo.textContent = 'No saved location yet.';
+      }
+    }
+
+    function saveLocation(lat, lon) {
+      const payload = {lat, lon, t: Date.now()};
+      localStorage.setItem(KEY_LOC, JSON.stringify(payload));
+      loadSaved();
+      alerted = false;
+    }
+
+    function clearSaved() {
+      localStorage.removeItem(KEY_LOC);
+      loadSaved();
+    }
+
+    function saveRadius(v) {
+      localStorage.setItem(KEY_RADIUS, String(v));
+      radiusVal.textContent = v + ' m';
+    }
+
+    // Notification helper
+    async function notify(title, body) {
+      if (window.Notification && Notification.permission === 'granted') {
+        try {
+          new Notification(title, {body});
+        } catch (e) {
+          console.warn('Notification failed', e);
+          alert(body);
+        }
+      } else {
+        // fallback
+        alert(body);
+      }
+      // also vibrate if available
+      if (navigator.vibrate) navigator.vibrate([200,100,200]);
+    }
+
+    function checkAndAlert(distance, radius) {
+      // If distance exceeds radius and not already alerted, notify
+      if (distance > radius && !alerted) {
+        alerted = true;
+        notify('Have you taken your tablet?', `You moved ${Math.round(distance)} m from the saved location (threshold ${radius} m).`);
+      }
+      // If user returns inside radius, reset alerted so they can be alerted again next time
+      if (distance <= radius && alerted) {
+        alerted = false;
+      }
+    }
+
+    // Position handling
+    function handlePosition(pos) {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      const acc = pos.coords.accuracy;
+      currentInfo.innerHTML = `<div class="coords">lat: ${lat.toFixed(6)}, lon: ${lon.toFixed(6)}</div><div style="font-size:12px;color:var(--muted)">accuracy: ${Math.round(acc)} m</div>`;
+
+      const locRaw = localStorage.getItem(KEY_LOC);
+      if (locRaw) {
+        const saved = JSON.parse(locRaw);
+        const dist = haversine(lat, lon, saved.lat, saved.lon);
+        lastDistance = dist;
+        distanceDisplay.textContent = Math.round(dist) + ' m';
+        distanceDetail.textContent = `From saved point (lat ${saved.lat.toFixed(5)}, lon ${saved.lon.toFixed(5)})`;
+        const radius = Number(localStorage.getItem(KEY_RADIUS) || radiusEl.value);
+        checkAndAlert(dist, radius);
+      } else {
+        distanceDisplay.textContent = '—';
+        distanceDetail.textContent = 'No saved location to compare.';
+      }
+    }
+
+    function handleError(err) {
+      console.warn('Geolocation error', err);
+      trackingStatus.textContent = 'Error getting position: ' + (err.message || err.code);
+    }
+
+    // Start/stop tracking
+    function startTracking() {
+      if (!('geolocation' in navigator)) { alert('Geolocation not supported by this browser.'); return; }
+      watchId = navigator.geolocation.watchPosition(handlePosition, handleError, {enableHighAccuracy: true, maximumAge: 5000, timeout: 10000});
+      trackingStatus.textContent = 'Tracking — watching position';
+      toggleTrackBtn.textContent = 'Stop tracking';
+    }
+
+    function stopTracking() {
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+      trackingStatus.textContent = 'Not tracking';
+      toggleTrackBtn.textContent = 'Start tracking';
+    }
+
+    // UI wiring
+    saveHereBtn.addEventListener('click', () => {
+      if (!('geolocation' in navigator)) { alert('Geolocation not supported.'); return; }
+      navigator.geolocation.getCurrentPosition(pos => {
+        saveLocation(pos.coords.latitude, pos.coords.longitude);
+        notify('Location saved', 'Saved current location for medication reminder.');
+      }, err => alert('Could not get current position: ' + (err.message || err.code)), {enableHighAccuracy: true});
+    });
+
+    clearSavedBtn.addEventListener('click', () => {
+      if (confirm('Clear saved location?')) clearSaved();
+    });
+
+    radiusEl.addEventListener('input', (e) => {
+      radiusVal.textContent = e.target.value + ' m';
+    });
+
+    saveRadiusBtn.addEventListener('click', () => {
+      saveRadius(radiusEl.value);
+      notify('Radius saved', `Threshold set to ${radiusEl.value} m`);
+    });
+
+    toggleTrackBtn.addEventListener('click', () => {
+      if (watchId === null) startTracking(); else stopTracking();
+    });
+
+    requestNotifsBtn.addEventListener('click', async () => {
+      if (!('Notification' in window)) { alert('Notifications not supported in this browser.'); return; }
+      const perm = await Notification.requestPermission();
+      alert('Notification permission: ' + perm);
+    });
+
+    // initialize
+    loadSaved();
+
+    // Optionally: ask for permission early for best UX
+    if (Notification && Notification.permission === 'default') {
+      // do nothing automatically — let user click Request permission
+    }
+
+    // Save radius initial
+    saveRadius(radiusEl.value);
+  </script>
+</body>
+</html>
